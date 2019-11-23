@@ -100,7 +100,7 @@ class webosTvAccessory {
 		this.lgtv = new Lgtv2({
 			url: this.url,
 			timeout: 5000,
-			reconnect: 3000,
+			reconnect: 20000,
 			keyFile: this.keyFile
 		});
 
