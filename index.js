@@ -23,7 +23,8 @@ class webosTvAccessory {
 		this.log = log;
 		this.port = 3000;
 
-		// configuration
+    // configuration
+    this.statusHttpUrl = config['statusHttpUrl'];
 		this.ip = config['ip'];
 		this.name = config['name'] || 'webOS TV';
 		this.mac = config['mac'];
@@ -79,7 +80,8 @@ class webosTvAccessory {
 		this.tvCurrentAppId = '';
 		this.launchLiveTvChannel = null;
 		this.isPaused = false;
-		this.tvCurrentSoundOutput = '';
+    this.tvCurrentSoundOutput = '';
+    this.lastConnectionEvent = null;
 
 
 		// check if prefs directory ends with a /, if not then add it
@@ -113,18 +115,35 @@ class webosTvAccessory {
 		this.lgtv.on('connect', () => {
 			this.log.info('webOS - connected to TV');
 			this.getTvInformation();
-			this.connected = true;
-			this.updateTvStatus(null, true);
-			this.subscribeToServices();
-			this.connectToPointerInputSocket();
-			this.updateAccessoryStatus();
+      this.connected = true;
+      this.updateTvStatus(null, true);
+      this.subscribeToServices();
+      this.connectToPointerInputSocket();
+      this.updateAccessoryStatus();
+      
 		});
 
 		this.lgtv.on('close', () => {
-			this.log.info('webOS - disconnected from TV');
-			this.connected = false;
-			this.pointerInputSocket = null;
-			this.updateTvStatus(null, false);
+      // if a connection or disconnection was processed in the last 15 seconds then we don't
+      // probe for TV state as the LG is a bit unreliable in giving state during boot/shutdown
+      // which causes the TV to "flicker" on and off in Homekit
+      var skip = false;
+
+      var d = new Date().getTime();
+
+      if (this.lastConnectionEvent != null) {
+        if (this.lastConnectionEvent > (d - 12000)) {
+          skip = true;
+          this.log.info('webOS - disconnected from TV, skipped as lastConnectionEvent < 12 secs ago');
+        }
+      }
+
+      if (!skip) {
+        this.log.info('webOS - disconnected from TV');
+        this.connected = false;   
+        this.pointerInputSocket = null;
+        this.updateTvStatus(null, false);
+      }
 		});
 
 		this.lgtv.on('error', (error) => {
@@ -208,9 +227,75 @@ class webosTvAccessory {
 				this.log.error('webOS - TV app check - error while getting current app');
 			} else {
 				if (res.appId) {
-					this.tvCurrentAppId = res.appId;
-					this.setAppSwitchManually(null, true, this.tvCurrentAppId);
-					this.log.info('webOS - app launched, current appId: %s', res.appId);
+
+          var needsHttpLookup = false;
+
+          for (let aId of this.inputAppIds) {
+            if (aId.indexOf(res.appId) > -1) {
+              if (aId.split('#')[1] !== '') {
+                needsHttpLookup = true;
+              }
+              break;
+            }
+          }
+
+          if (needsHttpLookup) {
+
+            const http = require('http');
+
+            http.get(this.statusHttpUrl, (resp) => {
+              let data = '';
+              resp.on('data', (chunk) => {
+                data += chunk;
+              });
+              resp.on('end', () => {
+                var inputFromHttp = JSON.parse(data).value;
+                var inputName = null;
+                for (let v of this.inputAppIds) {
+                  if (v.indexOf('#') > -1) {
+                    if (v.split('#')[1] === inputFromHttp.replace(/\s/g, '')) {
+                      inputName = v;
+                      break;
+                    }
+                  }
+                }
+
+                if (inputName != null) {
+                  //console.log('Input with name ' + inputName + ' returned from Indigo.');
+                  //console.log('inputName: ' + inputName);
+                  //console.log('this.inputAppIds: ' + JSON.stringify(this.inputAppIds, 0, 2));
+                  
+                  var inputIndex = this.inputAppIds.indexOf(inputName);
+                  this.tvCurrentAppId = inputIndex;
+                  this.setAppSwitchManually(null, true, this.tvCurrentAppId);
+                  this.log.info('webOS - app launched, current appId: %s', inputIndex);
+                  this.tvService.getCharacteristic(Characteristic.ActiveIdentifier).updateValue(inputIndex);
+
+                //} else {
+                  //console.log('Could not locate input index')
+                }
+
+              });
+
+              }).on("error", (err) => {
+                console.log("Error opening statusHttpUrl: " + this.statusHttpUrl + " - " + err.message);
+              });
+
+          } else {
+            if (this.tvService && this.inputAppIds && this.inputAppIds.length > 0) {
+              let inputIdentifier = this.inputAppIds.indexOf(res.appId + '#');
+              if (inputIdentifier === -1) {
+                inputIdentifier = 9999999; // select with id that does not exists
+                this.log.debug('webOS - input not found in the input list, not selecting any input');
+              }
+              this.tvCurrentAppId = inputIdentifier;
+              this.setAppSwitchManually(null, true, this.tvCurrentAppId);
+              this.log.info('webOS - app launched, current appId: %s', inputIdentifier);
+              this.tvService.getCharacteristic(Characteristic.ActiveIdentifier).updateValue(inputIdentifier);
+            }
+          }
+          
+          /*
 					if (this.channelButtonService) {
 						if (this.tvCurrentAppId === 'com.webos.app.livetv') {
 							// if the launchLiveTvChannel variable is not empty then switch to the specified channel and set the varaible to null
@@ -225,16 +310,9 @@ class webosTvAccessory {
 							this.setChannelButtonManually(null, false, null);
 						}
 
-					}
+					}*/
 
-					if (this.tvService && this.inputAppIds && this.inputAppIds.length > 0) {
-						let inputIdentifier = this.inputAppIds.indexOf(res.appId);
-						if (inputIdentifier === -1) {
-							inputIdentifier = 9999999; // select with id that does not exists
-							this.log.debug('webOS - input not found in the input list, not selecting any input');
-						}
-						this.tvService.getCharacteristic(Characteristic.ActiveIdentifier).updateValue(inputIdentifier);
-					}
+					
 				}
 			}
 		});
@@ -342,8 +420,8 @@ class webosTvAccessory {
 		this.tvService
 			.getCharacteristic(Characteristic.ActiveIdentifier)
 			.on('set', (inputIdentifier, callback) => {
-				this.log.debug('webOS - input source changed, new input source identifier: %d, source appId: %s', inputIdentifier, this.inputAppIds[inputIdentifier]);
-				this.setAppSwitchState(true, callback, this.inputAppIds[inputIdentifier]);
+				this.log.log('webOS - input source changed, new input source identifier: %d, source appId: %s', inputIdentifier, this.inputAppIds[inputIdentifier]);
+				this.setAppSwitchState(true, callback, this.inputAppIds[inputIdentifier], this.inputHttpUrls[inputIdentifier]);
 			});
 		this.tvService
 			.getCharacteristic(Characteristic.RemoteKey)
@@ -429,7 +507,8 @@ class webosTvAccessory {
 			this.log.debug('webOS - input names file does not exist');
 		}
 
-		this.inputAppIds = new Array();
+    this.inputAppIds = new Array();
+    this.inputHttpUrls = new Array();
 		this.inputs.forEach((value, i) => {
 
 			// get appid
@@ -478,7 +557,8 @@ class webosTvAccessory {
 
 				this.tvService.addLinkedService(tmpInput);
 				this.enabledServices.push(tmpInput);
-				this.inputAppIds.push(appId);
+        this.inputAppIds.push(appId);
+        this.inputHttpUrls.push(value.httpUrl);
 			}
 
 		});
@@ -970,17 +1050,37 @@ class webosTvAccessory {
 	}
 
 	checkTVState(callback) {
-		tcpp.probe(this.ip, this.port, (err, isAlive) => {
-			if (!isAlive && this.connected) {
-				this.connected = false;
-				this.lgtv.disconnect();
-			} else if (isAlive && !this.connected) {
-				this.lgtv.connect(this.url);
-				this.connected = true;
-			}
-			this.log.debug('webOS - TV state: %s', this.connected ? 'On' : 'Off');
-			callback(null, this.connected);
-		});
+    
+    // if a connection or disconnection was processed in the last 15 seconds then we don't
+    // probe for TV state as the LG is a bit unreliable in giving state during boot/shutdown
+    // which causes the TV to "flicker" on and off in Homekit
+    var skip = false;
+
+    var d = new Date().getTime();
+
+    if (this.lastConnectionEvent != null) {
+      if (this.lastConnectionEvent > (d - 2000)) {
+        skip = true;
+        this.log.info('checkTVState - skipped as lastConnectionEvent');
+      }
+    }
+
+    if (!skip) {
+      tcpp.probe(this.ip, this.port, (err, isAlive) => {
+        if (!isAlive && this.connected) {
+          this.log.info('checkTVState.disconnect');
+          this.lgtv.disconnect();
+          this.connected = false;
+        } else if (isAlive && !this.connected) {
+          
+          this.log.info('checkTVState.connect');
+          this.lgtv.connect(this.url);
+          this.connected = true;
+        }
+        this.log.debug('webOS - TV state: %s', this.connected ? 'On' : 'Off');
+        callback(null, this.connected);
+      });
+    }
 	}
 
 	checkForegroundApp(callback, appId) {
@@ -990,7 +1090,8 @@ class webosTvAccessory {
 					this.log.debug('webOS - current app - error while getting current app info');
 					callback(null, false, null); // disable all switches
 				} else {
-					this.log.debug('webOS - TV current appId: %s', res.appId);
+          this.log.debug('webOS - TV current appId 2: %s', res.appId);
+          
 					if (appId === undefined || appId === null) { // if appId undefined or null then i am checking which app is currently running; if set then continue normally
 						callback(null, true, res.appId);
 					} else if (res.appId === appId) {
@@ -1073,8 +1174,12 @@ class webosTvAccessory {
 	}
 
 	setPowerState(state, callback) {
+
+    this.lastConnectionEvent = new Date().getTime();
+
 		if (state) {
-			this.log.debug('webOS - power service - Trying to power on tv, sending magic packet');
+
+			this.log.info('webOS - power service - Trying to power on tv, sending magic packet');
 			wol.wake(this.mac, {
 				'address': this.broadcastAdr
 			}, (error) => {
@@ -1085,17 +1190,19 @@ class webosTvAccessory {
 			})
 			callback();
 		} else {
-			if (this.connected) {
-				this.log.debug('webOS - power service - TV turned off');
+			//if (this.connected) {
+				this.log.info('webOS - power service - TV turned off');
 				this.lgtv.request('ssap://system/turnOff', (err, res) => {
-					this.lgtv.disconnect();
-					this.connected = false;
-					this.setAppSwitchManually(null, false, null);
-					this.setChannelButtonManually(null, false, null);
-					this.setMuteStateManually(false);
-					this.setSoundOutputManually(null, false, null);
+          this.lgtv.disconnect();
+          this.connected = false;
+          this.setAppSwitchManually(null, false, null);
+          this.setChannelButtonManually(null, false, null);
+          this.setMuteStateManually(false);
+          this.setSoundOutputManually(null, false, null);
 				})
-			}
+			//} else {
+			//	this.log.info('webOS - power service - TV turned off - TURNOFF ATTEMPTED WHEN NOT CONNECTED!');
+      //}
 			callback();
 		}
 	}
@@ -1203,28 +1310,43 @@ class webosTvAccessory {
 		}
 	}
 
-	setAppSwitchState(state, callback, appId) {
+	setAppSwitchState(state, callback, appId, httpUrl) {
 		if (this.connected) {
 			if (state) {
 				this.log.debug('webOS - app switch service - launching app with id %s', appId);
 				this.lgtv.request('ssap://system.launcher/launch', {
-					id: appId
-				});
-				this.setAppSwitchManually(null, true, appId);
+					id: appId.split('#')[0]
+        });
+        if (httpUrl) {
+
+          const http = require('http');
+
+          http.get(httpUrl, (resp) => {
+            // The whole response has been received. Print out the result.
+            resp.on('end', () => {
+              //console.log('Opened httpUrl: ' + httpUrl);
+            });
+
+          }).on("error", (err) => {
+            console.log("Error opening httpUrl: " + httpUrl + " - " + err.message);
+          });
+
+        }
+				this.setAppSwitchManually(null, true, appId.split('#')[0]);
 				this.setChannelButtonManually(null, false, null);
 			} else { // prevent turning off the switch, since this is the current app we should not turn off the switch
 				setTimeout(() => {
-					this.setAppSwitchManually(null, true, appId);
+					this.setAppSwitchManually(null, true, appId.split('#')[0]);
 				}, 10);
 			}
 			callback();
 		} else {
 			if (state) {
-				this.log.info('webOS - app switch service - Trying to launch %s but TV is off, attempting to power on the TV', appId);
+				this.log.info('webOS - app switch service - Trying to launch %s but TV is off, attempting to power on the TV', appId.split('#')[0]);
 				this.powerOnTvWithCallback(() => {
-					this.log.debug('webOS - app switch service - tv powered on, launching app with id: %s', appId);
+					this.log.debug('webOS - app switch service - tv powered on, launching app with id: %s', appId.split('#')[0]);
 					this.lgtv.request('ssap://system.launcher/launch', {
-						id: appId
+						id: appId.split('#')[0]
 					});
 					callback();
 				});
