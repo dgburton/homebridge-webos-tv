@@ -147,7 +147,7 @@ class webosTvAccessory {
 		});
 
 		this.lgtv.on('error', (error) => {
-			this.log.error('webOS - %s', error);
+			//this.log.error('webOS - %s', error);
 		});
 
 		this.lgtv.on('prompt', () => {
